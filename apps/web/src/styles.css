@@ -79,6 +79,8 @@ fieldset { border: none; padding: 0; margin: 0; } legend { color: var(--muted); 
 .row { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; margin: 6px 0; } .row > * { flex: 1; min-width: 100px; }
 .seg { display: flex; } .seg button { flex: 1; border-radius: 0; } .seg button:first-child { border-radius: 8px 0 0 8px; } .seg button:last-child { border-radius: 0 8px 8px 0; }
 textarea { resize: vertical; }
+/* A placeholder is an example, never a value that looks already typed (issue #33). */
+input::placeholder, textarea::placeholder { color: var(--muted); opacity: .7; font-style: italic; }
 
 @media (max-width: 480px) { .chip em { display: none; } .chip { padding: 3px 7px; }
   /* A fifth tab (Account, Market…) opened from ⋯ must not push Colony off the strip at 390 px. */
@@ -220,9 +222,12 @@ button.enter { border-color: var(--accent); color: var(--accent); font-weight: 6
 .counsel .card p { margin: 0 0 6px; font-size: 14px; line-height: 1.35; }
 .counsel .acts { display: flex; gap: 6px; flex-wrap: wrap; } .counsel .acts button { font-size: 13px; padding: 5px 10px; }
 .counsel .acts button.primary { padding: 5px 12px; }
-.counsel .card.done { border-left-color: var(--ok); opacity: .85; animation: counsel-done 2.4s ease forwards; }
+.counsel .card.done { border-left-color: var(--ok); opacity: .85; animation: counsel-done 4s ease forwards; }
+/* The next tier's advice comes in after the done mark, not in its place (issue #33). */
+.counsel .card.fresh { animation: counsel-fresh .9s ease .5s both; }
+@keyframes counsel-fresh { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
 .counsel .card.done p { margin: 0; } .counsel .card.done b { color: var(--ok); }
-@keyframes counsel-done { 0%, 70% { opacity: .95; } 100% { opacity: 0; } }
+@keyframes counsel-done { 0%, 80% { opacity: .95; } 100% { opacity: 0; } }
 .counsel .acts button.link { background: none; border: 0; color: var(--muted); text-decoration: underline; padding: 5px 4px; }
 @media (max-width: 899px) { .counsel { margin: 4px 8px 0; } .counsel:not(.first) .card:nth-of-type(n+3) { display: none; } .counsel .card:nth-of-type(n+4) { display: none; } }
 

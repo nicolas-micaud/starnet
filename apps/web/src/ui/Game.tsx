@@ -12,6 +12,7 @@ import { LogisticsPanel } from './Logistics.js';
 import { InstallButton, RES, UpdateBanner, fmt, hms } from './bits.js';
 import { decreeLabel, describeEvent, describeNote, etaText, stamp } from './feed.js';
 import { CARD_LINES, cardAfterTalk, cardFromPending, pendingLineKey, visibleLines, type PendingCard } from './doctrine.js';
+import { doneCards, type ShownCard } from './counsel.js';
 import { marketPrefill, pendingDemo, pointAt, sceneFlashReq, stopTeaching, teach, teachClass, teachKey } from './teach.js';
 
 type Tab = 'colony' | 'system' | 'logistics' | 'market' | 'fleets' | 'diplomacy' | 'general' | 'log' | 'account';
@@ -19,6 +20,7 @@ type TplKey = 'tplForge' | 'tplOasis' | 'tplCrossroads' | 'tplGraveyard' | 'tplS
 const TPL_KEY: Record<string, TplKey> = { forge: 'tplForge', oasis: 'tplOasis', crossroads: 'tplCrossroads', graveyard: 'tplGraveyard', sanctuary: 'tplSanctuary', lair: 'tplLair', burnt: 'tplBurnt' };
 const selected = signal<string | null>(null);
 const linkFrom = signal<string | null>(null);
+const LINK_MODE_MS = 45000;
 // Back from Stripe's checkout: straight to the Account tab, where the thanks and the title wait.
 const tab = signal<Tab>(paidReturn.value ? 'account' : 'colony');
 const briefing = signal<{ text: string; source: string } | null>(null);
@@ -72,6 +74,12 @@ export function Game() {
   const brief = useSig(briefing);
   useEffect(() => { map.current?.setSelection(selV); }, [selV]);
   useEffect(() => { map.current?.setLinkFrom(linkV); }, [linkV]);
+  // The link mode is a lesson, not a state to live in: it closes itself if no star is tapped for a while (issue #33).
+  useEffect(() => {
+    if (!linkV) return;
+    const id = setTimeout(() => { if (linkFrom.value === linkV) linkFrom.value = null; }, LINK_MODE_MS);
+    return () => clearTimeout(id);
+  }, [linkV]);
   // The General points at a button: bring it into view; the lesson ends when the player taps it.
   const teachV = useSig(teach);
   useEffect(() => {
@@ -187,7 +195,7 @@ const skippedCounsel = signal<Set<string>>(new Set());
 const voiceCounsel = signal<CounselView | null>(null);
 let counselFetching = false;
 
-type UiCard = { id: string; title: string; line: string; hasCommand: boolean; urgency: 0 | 1 | 2; voice: boolean; go: () => void; run: () => Promise<boolean> };
+type UiCard = { id: string; title: string; line: string; command: Command | null; hasCommand: boolean; urgency: 0 | 1 | 2; voice: boolean; go: () => void; run: () => Promise<boolean> };
 
 type TKey = Parameters<typeof t>[0];
 const T = (k: string): string => String(t(k as TKey));
@@ -278,22 +286,31 @@ const dismissedCounsel = signal<Set<string>>(new Set());
 const lookedAt = new Set<string>();
 /** Cards that just left the Counsel because their goal is reached: shown "✓ Done" for a moment, then gone. */
 const doneCounsel = signal<Map<string, { title: string; index: number }>>(new Map());
-const DONE_MS = 2400;
-let lastShown: { id: string; title: string }[] = [];
+/** Cards that came in as others were done (the next tier's advice): they arrive visibly, not in place of the old. */
+const freshCounsel = signal<Set<string>>(new Set());
+const DONE_MS = 4000;
+let lastShown: ShownCard[] = [];
 let lastShownDraw = -1;
+/** What the Counsel wants from the voice layer right now; a fetch that answered for another tier is retried once. */
+let counselWanted = { draw: -1, tier: -1 };
 
-function markDone(cards: { id: string; title: string; index: number }[]): void {
+function markDone(cards: { id: string; title: string; index: number }[], fresh: string[]): void {
   if (!cards.length) return;
   const next = new Map(doneCounsel.value);
   for (const c of cards) next.set(c.id, { title: c.title, index: c.index });
   doneCounsel.value = next;
-  setTimeout(() => { const m = new Map(doneCounsel.value); for (const c of cards) m.delete(c.id); doneCounsel.value = m; }, DONE_MS);
+  if (fresh.length) freshCounsel.value = new Set([...freshCounsel.value, ...fresh]);
+  setTimeout(() => {
+    const m = new Map(doneCounsel.value); for (const c of cards) m.delete(c.id); doneCounsel.value = m;
+    const f = new Set(freshCounsel.value); for (const id of fresh) f.delete(id); freshCounsel.value = f;
+  }, DONE_MS);
 }
 
 function Counsel({ v, map }: { v: PlayerView; map: { current: GalaxyMap | null } }) {
   const skipped = useSig(skippedCounsel);
   const dismissed = useSig(dismissedCounsel);
   const done = useSig(doneCounsel);
+  const fresh = useSig(freshCounsel);
   const voice = useSig(voiceCounsel);
   const sel = useSig(selected);
   const sysMode = useSig(systemMode);
@@ -302,10 +319,17 @@ function Counsel({ v, map }: { v: PlayerView; map: { current: GalaxyMap | null }
   const tier = v.me.onboarding?.tier ?? 6;
   // One fetch per Draw and per onboarding tier: the voice cards are cached server-side until the Draw, rewritten
   // when a tier opens, and re-checked against the world on every read.
-  const refetch = (): void => {
+  counselWanted = { draw: nextDraw, tier };
+  // A tier that opens while a fetch is in flight (a quick "Do it" on the first relay) must not be lost: the answer
+  // for the old tier is retried once for the tier the colony is at now.
+  const refetch = (retry = true): void => {
     if (counselFetching) return;
     counselFetching = true;
-    void fetchCounsel(lang.value).then((c) => { if (c) voiceCounsel.value = c; }).finally(() => { counselFetching = false; });
+    void fetchCounsel(lang.value).then((c) => { if (c) voiceCounsel.value = c; }).finally(() => {
+      counselFetching = false;
+      const c = voiceCounsel.value;
+      if (retry && c && (c.drawIndex !== counselWanted.draw || (c.tier !== undefined && c.tier !== counselWanted.tier))) refetch(false);
+    });
   };
   useEffect(() => { if (!voice || voice.drawIndex !== nextDraw || (voice.tier !== undefined && voice.tier !== tier)) refetch(); }, [nextDraw, tier]);
   // A card whose goal is a place to look is done once the player is there, however they got there.
@@ -327,6 +351,9 @@ function Counsel({ v, map }: { v: PlayerView; map: { current: GalaxyMap | null }
     await wait(cmd.type === 'build_relay' ? 700 : 1100);
     if (systemMode.value) sceneFlashReq.value++;
     const r = await send();
+    // The demonstration opened the link mode to show the button; the General pressed it (or could not): close it,
+    // or "Tap a green star to link it" stays on screen as if something were still expected.
+    if (cmd.type === 'build_relay' && linkFrom.value === cmd.a) linkFrom.value = null;
     // Already done (by hand, meanwhile) or no longer on the table: the card leaves, nothing to press.
     if (r.gone) { stopTeaching(); refetch(); return true; }
     if (!r.ok) { stopTeaching(); return false; }
@@ -346,19 +373,25 @@ function Counsel({ v, map }: { v: PlayerView; map: { current: GalaxyMap | null }
   const liveIds = new Set(v.me.counsel.map((c) => c.id));
   const spoken = new Set(voiceCards.map((c) => c.id));
   const firstWords = voiceCards.length > 0 && voiceCards.every((c) => c.id.startsWith('first-')) && tier <= 0;
-  const fromVoice: UiCard[] = voiceCards.filter((c) => firstWords || liveIds.has(c.id)).map((c) => ({ id: c.id, title: c.title, line: c.line, hasCommand: !!c.command, urgency: 1 as const, voice: true, go: () => showMe(c.command, fromVoiceShow(c.show, c.raw)),
+  const fromVoice: UiCard[] = voiceCards.filter((c) => firstWords || liveIds.has(c.id)).map((c) => ({ id: c.id, title: c.title, line: c.line, command: c.command, hasCommand: !!c.command, urgency: 1 as const, voice: true, go: () => showMe(c.command, fromVoiceShow(c.show, c.raw)),
     run: () => doIt(c.command!, () => answerCounsel(c.id, true)) }));
-  const fromSim: UiCard[] = v.me.counsel.filter((c) => !spoken.has(c.id)).map((c) => ({ id: c.id, title: counselTitle(c, lang.value), line: counselLine(c, lang.value), hasCommand: !!c.command, urgency: c.urgency, voice: false, go: () => showMe(c.command, c.show),
+  const fromSim: UiCard[] = v.me.counsel.filter((c) => !spoken.has(c.id)).map((c) => ({ id: c.id, title: counselTitle(c, lang.value), line: counselLine(c, lang.value), command: c.command, hasCommand: !!c.command, urgency: c.urgency, voice: false, go: () => showMe(c.command, c.show),
     run: () => doIt(c.command!, async () => ({ ok: await act(c.command!), reply: null })) }));
   const order = new Map(v.me.counsel.map((c, i) => [c.id, i]));
   const cards = [...fromVoice, ...fromSim].sort((a, b) => (order.get(a.id) ?? 99) - (order.get(b.id) ?? 99));
   const shown = cards.filter((c) => !skipped.has(c.id));
-  // A card that was on screen and left without "Not now" reached its goal (taken, or done by hand): it says so.
+  // A card that was on screen and left because its goal is reached (taken, looked at, or done by hand) says so; a
+  // card only pushed out of the top three by the next tier's advice leaves quietly (issue #33).
   useEffect(() => {
     const ids = new Set(shown.map((c) => c.id));
     // A new Draw renews the whole Counsel: nothing was "done", the hour turned.
-    if (lastShownDraw === nextDraw) markDone(lastShown.map((c, index) => ({ ...c, index })).filter((c) => !ids.has(c.id) && !dismissed.has(c.id) && !done.has(c.id)));
-    lastShown = shown.map((c) => ({ id: c.id, title: c.title }));
+    if (lastShownDraw === nextDraw) {
+      const answered = new Set([...[...skipped].filter((id) => !dismissed.has(id)), ...lookedAt]);
+      const gone = doneCards(lastShown, ids, v, answered, new Set([...dismissed, ...done.keys()]));
+      const before = new Set(lastShown.map((c) => c.id));
+      markDone(gone, shown.filter((c) => !before.has(c.id)).map((c) => c.id));
+    }
+    lastShown = shown.map((c) => ({ id: c.id, title: c.title, command: c.command }));
     lastShownDraw = nextDraw;
   });
   // The "✓ Done" cards keep their place for a moment, so the stack does not jump under the finger.
@@ -371,7 +404,7 @@ function Counsel({ v, map }: { v: PlayerView; map: { current: GalaxyMap | null }
       {rows.map((r) => r.kind === 'done' ? (
         <div key={r.id} class="card done" aria-live="polite"><p><b>✓ {t('counselDoneMark')}</b> · {r.title}</p></div>
       ) : (
-        <div key={r.c.id} class={`card u${r.c.urgency}`}>
+        <div key={r.c.id} class={`card u${r.c.urgency} ${fresh.has(r.c.id) ? 'fresh' : ''}`}>
           <p><b>{r.c.title}</b> · {r.c.line}</p>
           <div class="acts">
             <button onClick={r.c.go}>{t('showMe')}</button>
